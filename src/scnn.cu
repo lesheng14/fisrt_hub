@@ -301,6 +301,26 @@ static inline void flatten(const float* d_input, float* d_output, int channels, 
     flatten_kernel<<<gridSize, blockSize, 0, stream>>>(d_input, d_output, channels, height, width);
 }
 
+// ==================== 设备端 Argmax 内核 ====================
+__global__ void argmax_kernel(const float* __restrict__ input, int size, int* __restrict__ out_index)
+{
+    // 数量很小（10 类），单线程实现即可，避免额外同步与共享内存开销
+    if (threadIdx.x == 0 && blockIdx.x == 0) {
+        int best_idx = 0;
+        float best_val = input[0];
+        for (int i = 1; i < size; ++i) {
+            float v = input[i];
+            if (v > best_val) { best_val = v; best_idx = i; }
+        }
+        *out_index = best_idx;
+    }
+}
+
+static inline void argmax_device(const float* d_input, int size, int* d_out_index, cudaStream_t stream = 0)
+{
+    argmax_kernel<<<1, 1, 0, stream>>>(d_input, size, d_out_index);
+}
+
 
 std::vector<int> scnn_inference(
     const std::vector<std::vector<float>>& images,
@@ -369,6 +389,9 @@ std::vector<int> scnn_inference(
 
     // Membrane potentials for IF nodes
     float *d_m1 = nullptr, *d_m2 = nullptr, *d_m3 = nullptr, *d_m4 = nullptr;
+    // Accumulated logits and argmax index on device
+    float *d_logits_sum = nullptr;
+    int   *d_pred_index = nullptr;
 
     checkCudaErrors(cudaMalloc(&d_image,     in_channels * in_height * in_width * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv1_out, conv1_out_elems * sizeof(float)));
@@ -384,9 +407,9 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaMalloc(&d_m2, conv2_out_elems * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_m3, fc1_out_features * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_m4, fc2_out_features * sizeof(float)));
-
-    // Host buffer for per-timestep fc3 output
-    std::vector<float> h_fc3(fc3_out_features);
+    // Allocate device buffers for logits accumulation and argmax
+    checkCudaErrors(cudaMalloc(&d_logits_sum, fc3_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pred_index, sizeof(int)));
 
     // --- Loop over images ---
     for (int i = 0; i < num_images; ++i) {
@@ -402,8 +425,8 @@ std::vector<int> scnn_inference(
         checkCudaErrors(cudaMemset(d_m3, 0, fc1_out_features  * sizeof(float)));
         checkCudaErrors(cudaMemset(d_m4, 0, fc2_out_features  * sizeof(float)));
 
-        // Accumulate logits across T steps
-        std::vector<float> logits_sum(fc3_out_features, 0.0f);
+        // Accumulate logits across T steps on device
+        checkCudaErrors(cudaMemset(d_logits_sum, 0, fc3_out_features * sizeof(float)));
 
         for (int t = 0; t < T; ++t) {
             // conv1 -> IF1 -> pool1
@@ -445,20 +468,14 @@ std::vector<int> scnn_inference(
 
             // fc3
             linear(d_fc2_out, d_fc3_w, d_fc3_b, d_fc3_out, fc3_in_features, fc3_out_features);
-
-            // copy fc3 out to host and accumulate
-            checkCudaErrors(cudaMemcpy(h_fc3.data(), d_fc3_out, fc3_out_features * sizeof(float), cudaMemcpyDeviceToHost));
-            for (int k = 0; k < fc3_out_features; ++k) {
-                logits_sum[k] += h_fc3[k];
-            }
+            // Accumulate logits on device to avoid host-device transfers per timestep
+            vector_add(d_logits_sum, d_fc3_out, d_logits_sum, fc3_out_features);
         }
 
-        // select argmax
+        // select argmax on device and copy back a single int
+        argmax_device(d_logits_sum, fc3_out_features, d_pred_index);
         int pred = 0;
-        float best = logits_sum[0];
-        for (int k = 1; k < fc3_out_features; ++k) {
-            if (logits_sum[k] > best) { best = logits_sum[k]; pred = k; }
-        }
+        checkCudaErrors(cudaMemcpy(&pred, d_pred_index, sizeof(int), cudaMemcpyDeviceToHost));
         predictions.push_back(pred);
     }
 
@@ -476,6 +493,8 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaFree(d_m2));
     checkCudaErrors(cudaFree(d_m3));
     checkCudaErrors(cudaFree(d_m4));
+    checkCudaErrors(cudaFree(d_logits_sum));
+    checkCudaErrors(cudaFree(d_pred_index));
 
     return predictions;
 }
