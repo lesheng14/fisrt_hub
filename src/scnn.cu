@@ -105,33 +105,42 @@ static inline void if_neuron(
 __global__ void conv2d_kernel(
     const float* __restrict__ input, const float* __restrict__ weight, const float* __restrict__ bias,
     float* __restrict__ output,
+    int batch_size,
     int in_channels, int in_height, int in_width,
     int out_channels, int out_height, int out_width,
     int kernel_size, int stride, int padding)
 {
-    int oc = blockIdx.x * blockDim.x + threadIdx.x;
+    int ocn = blockIdx.x * blockDim.x + threadIdx.x; // flattened (n, oc)
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
     int ow = blockIdx.z * blockDim.z + threadIdx.z;
 
-    if (oc < out_channels && oh < out_height && ow < out_width) {
+    if (ocn < batch_size * out_channels && oh < out_height && ow < out_width) {
+        int n  = ocn / out_channels;
+        int oc = ocn % out_channels;
+
         float sum = 0.0f;
+        int in_hw = in_height * in_width;
+        int out_hw = out_height * out_width;
+        int input_batch_base  = n * (in_channels * in_hw);
+        int output_batch_base = n * (out_channels * out_hw);
+
         for (int ic = 0; ic < in_channels; ++ic) {
             for (int kh = 0; kh < kernel_size; ++kh) {
+                int ih = oh * stride - padding + kh;
+                if (ih < 0 || ih >= in_height) continue;
                 for (int kw = 0; kw < kernel_size; ++kw) {
-                    int ih = oh * stride - padding + kh;
                     int iw = ow * stride - padding + kw;
-                    if (ih >= 0 && ih < in_height && iw >= 0 && iw < in_width) {
-                        int input_idx = ic * (in_height * in_width) + ih * in_width + iw;
-                        int weight_idx = oc * (in_channels * kernel_size * kernel_size)
-                                       + ic * (kernel_size * kernel_size)
-                                       + kh * kernel_size + kw;
-                        sum += input[input_idx] * weight[weight_idx];
-                    }
+                    if (iw < 0 || iw >= in_width) continue;
+                    int input_idx = input_batch_base + ic * in_hw + ih * in_width + iw;
+                    int weight_idx = oc * (in_channels * kernel_size * kernel_size)
+                                   + ic * (kernel_size * kernel_size)
+                                   + kh * kernel_size + kw;
+                    sum += input[input_idx] * weight[weight_idx];
                 }
             }
         }
         if (bias != nullptr) { sum += bias[oc]; }
-        int output_idx = oc * (out_height * out_width) + oh * out_width + ow;
+        int output_idx = output_batch_base + oc * out_hw + oh * out_width + ow;
         output[output_idx] = sum;
     }
 }
@@ -139,6 +148,7 @@ __global__ void conv2d_kernel(
 static inline void conv2d(
     const float* d_input, const float* d_weight, const float* d_bias,
     float* d_output,
+    int batch_size,
     int in_channels, int in_height, int in_width,
     int out_channels, int kernel_size, int stride, int padding,
     cudaStream_t stream = 0)
@@ -148,13 +158,14 @@ static inline void conv2d(
 
     dim3 blockSize(4, 4, 4);
     dim3 gridSize(
-        (out_channels + blockSize.x - 1) / blockSize.x,
+        (batch_size * out_channels + blockSize.x - 1) / blockSize.x,
         (out_height  + blockSize.y - 1) / blockSize.y,
         (out_width   + blockSize.z - 1) / blockSize.z
     );
 
     conv2d_kernel<<<gridSize, blockSize, 0, stream>>>(
         d_input, d_weight, d_bias, d_output,
+        batch_size,
         in_channels, in_height, in_width,
         out_channels, out_height, out_width,
         kernel_size, stride, padding
@@ -165,36 +176,46 @@ static inline void conv2d(
 // ==================== 最大池化核函数 ====================
 __global__ void max_pool2d_kernel(
     const float* __restrict__ input, float* __restrict__ output,
+    int batch_size,
     int channels, int in_height, int in_width,
     int pool_size, int stride)
 {
-    int c  = blockIdx.x * blockDim.x + threadIdx.x;
+    int cn = blockIdx.x * blockDim.x + threadIdx.x; // flattened (n, c)
     int oh = blockIdx.y * blockDim.y + threadIdx.y;
     int ow = blockIdx.z * blockDim.z + threadIdx.z;
 
     int out_height = (in_height - pool_size) / stride + 1;
     int out_width  = (in_width  - pool_size) / stride + 1;
 
-    if (c < channels && oh < out_height && ow < out_width) {
-        int out_idx = c * (out_height * out_width) + oh * out_width + ow;
+    if (cn < batch_size * channels && oh < out_height && ow < out_width) {
+        int n = cn / channels;
+        int c = cn % channels;
+        int in_hw = in_height * in_width;
+        int out_hw = out_height * out_width;
+
+        int input_batch_base  = n * (channels * in_hw);
+        int output_batch_base = n * (channels * out_hw);
+
         float max_val = -1e9f;
         for (int ph = 0; ph < pool_size; ++ph) {
+            int ih = oh * stride + ph;
+            if (ih >= in_height) break;
             for (int pw = 0; pw < pool_size; ++pw) {
-                int ih = oh * stride + ph;
                 int iw = ow * stride + pw;
-                if (ih < in_height && iw < in_width) {
-                    int in_idx = c * (in_height * in_width) + ih * in_width + iw;
-                    float v = input[in_idx];
-                    max_val = v > max_val ? v : max_val;
-                }
+                if (iw >= in_width) break;
+                int in_idx = input_batch_base + c * in_hw + ih * in_width + iw;
+                float v = input[in_idx];
+                max_val = v > max_val ? v : max_val;
             }
         }
+        int out_idx = output_batch_base + c * out_hw + oh * out_width + ow;
         output[out_idx] = max_val;
     }
 }
 
 static inline void max_pool2d(
     const float* d_input, float* d_output,
+    int batch_size,
     int channels, int in_height, int in_width,
     int pool_size, int stride,
     cudaStream_t stream = 0)
@@ -204,13 +225,14 @@ static inline void max_pool2d(
 
     dim3 blockSize(8, 4, 4);
     dim3 gridSize(
-        (channels   + blockSize.x - 1) / blockSize.x,
+        (batch_size * channels + blockSize.x - 1) / blockSize.x,
         (out_height + blockSize.y - 1) / blockSize.y,
         (out_width  + blockSize.z - 1) / blockSize.z
     );
 
     max_pool2d_kernel<<<gridSize, blockSize, 0, stream>>>(
         d_input, d_output,
+        batch_size,
         channels, in_height, in_width,
         pool_size, stride
     );
@@ -221,30 +243,37 @@ static inline void max_pool2d(
 __global__ void linear_kernel(
     const float* __restrict__ input, const float* __restrict__ weight, const float* __restrict__ bias,
     float* __restrict__ output,
+    int batch_size,
     int in_features, int out_features)
 {
-    int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (out_idx < out_features) {
+    int oxn = blockIdx.x * blockDim.x + threadIdx.x; // flattened (n, out_idx)
+    if (oxn < batch_size * out_features) {
+        int n       = oxn / out_features;
+        int out_idx = oxn % out_features;
+
         float sum = 0.0f;
-        int base = out_idx * in_features;
+        int weight_row_base = out_idx * in_features;
+        int input_base      = n * in_features;
         for (int in_idx = 0; in_idx < in_features; ++in_idx) {
-            sum += input[in_idx] * weight[base + in_idx];
+            sum += input[input_base + in_idx] * weight[weight_row_base + in_idx];
         }
         if (bias != nullptr) { sum += bias[out_idx]; }
-        output[out_idx] = sum;
+        output[n * out_features + out_idx] = sum;
     }
 }
 
 static inline void linear(
     const float* d_input, const float* d_weight, const float* d_bias,
     float* d_output,
+    int batch_size,
     int in_features, int out_features,
     cudaStream_t stream = 0)
 {
     int blockSize = 256;
-    int gridSize = (out_features + blockSize - 1) / blockSize;
+    int gridSize = (batch_size * out_features + blockSize - 1) / blockSize;
     linear_kernel<<<gridSize, blockSize, 0, stream>>>(
         d_input, d_weight, d_bias, d_output,
+        batch_size,
         in_features, out_features
     );
 }
@@ -279,32 +308,36 @@ static inline void vector_scale(const float* d_input, float scalar, float* d_out
 
 
 // ==================== 展平操作核函数 ====================
-__global__ void flatten_kernel(const float* input, float* output, int channels, int height, int width)
+__global__ void flatten_kernel(const float* input, float* output, int batch_size, int channels, int height, int width)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total_size = channels * height * width;
+    int per_sample = channels * height * width;
+    int total_size = batch_size * per_sample;
     if (idx < total_size) {
-        int c  = idx / (height * width);
-        int hw = idx % (height * width);
+        int n  = idx / per_sample;
+        int pos = idx % per_sample;
+        int c  = pos / (height * width);
+        int hw = pos % (height * width);
         int h  = hw / width;
         int w  = hw % width;
-        int input_idx = c * (height * width) + h * width + w;
-        output[idx] = input[input_idx];
+        int input_idx  = n * per_sample + c * (height * width) + h * width + w;
+        int output_idx = n * per_sample + pos;
+        output[output_idx] = input[input_idx];
     }
 }
 
-static inline void flatten(const float* d_input, float* d_output, int channels, int height, int width, cudaStream_t stream = 0)
+static inline void flatten(const float* d_input, float* d_output, int batch_size, int channels, int height, int width, cudaStream_t stream = 0)
 {
-    int total_size = channels * height * width;
+    int per_sample = channels * height * width;
+    int total_size = batch_size * per_sample;
     int blockSize = 256;
     int gridSize = (total_size + blockSize - 1) / blockSize;
-    flatten_kernel<<<gridSize, blockSize, 0, stream>>>(d_input, d_output, channels, height, width);
+    flatten_kernel<<<gridSize, blockSize, 0, stream>>>(d_input, d_output, batch_size, channels, height, width);
 }
 
 // ==================== 设备端 Argmax 内核 ====================
 __global__ void argmax_kernel(const float* __restrict__ input, int size, int* __restrict__ out_index)
 {
-    // 数量很小（10 类），单线程实现即可，避免额外同步与共享内存开销
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         int best_idx = 0;
         float best_val = input[0];
@@ -316,60 +349,72 @@ __global__ void argmax_kernel(const float* __restrict__ input, int size, int* __
     }
 }
 
+__global__ void argmax_batch_kernel(const float* __restrict__ input, int size, int batch_size, int* __restrict__ out_indices)
+{
+    // One block per sample, single thread is enough for 10 classes
+    int n = blockIdx.x;
+    if (n < batch_size && threadIdx.x == 0) {
+        int base = n * size;
+        int best_idx = 0;
+        float best_val = input[base + 0];
+        for (int i = 1; i < size; ++i) {
+            float v = input[base + i];
+            if (v > best_val) { best_val = v; best_idx = i; }
+        }
+        out_indices[n] = best_idx;
+    }
+}
+
 static inline void argmax_device(const float* d_input, int size, int* d_out_index, cudaStream_t stream = 0)
 {
     argmax_kernel<<<1, 1, 0, stream>>>(d_input, size, d_out_index);
 }
 
+static inline void argmax_batch_device(const float* d_input, int size, int batch_size, int* d_out_indices, cudaStream_t stream = 0)
+{
+    argmax_batch_kernel<<<batch_size, 1, 0, stream>>>(d_input, size, batch_size, d_out_indices);
+}
+
 
 std::vector<int> scnn_inference(
     const std::vector<std::vector<float>>& images,
-    // Device pointers for parameters
     float* d_conv1_w, float* d_conv1_b, float* d_conv2_w, float* d_conv2_b,
     float* d_fc1_w,   float* d_fc1_b,   float* d_fc2_w,   float* d_fc2_b,
-    float* d_fc3_w,   float* d_fc3_b
-    // YOU CAN ADD MORE PARAMETERS HERE!!!
-    )
+    float* d_fc3_w,   float* d_fc3_b)
 {
     std::vector<int> predictions;
     const int num_images = static_cast<int>(images.size());
     predictions.reserve(num_images);
 
-    // SNN-specific parameter, must match training
     const int T = 8;
 
-    // Network dimensions (FashionMNIST: 1x28x28)
     const int in_channels = 1;
     const int in_height   = 28;
     const int in_width    = 28;
+    const int image_elems = in_channels * in_height * in_width;
 
-    // conv1: 1 -> 6, k=5, s=1, p=0
     const int conv1_out_channels = 6;
     const int conv1_kernel = 5, conv1_stride = 1, conv1_pad = 0;
     const int conv1_out_height = (in_height + 2 * conv1_pad - conv1_kernel) / conv1_stride + 1; // 24
     const int conv1_out_width  = (in_width  + 2 * conv1_pad - conv1_kernel) / conv1_stride + 1; // 24
-    const int conv1_out_elems  = conv1_out_channels * conv1_out_height * conv1_out_width;       // 6*24*24=3456
+    const int conv1_out_elems  = conv1_out_channels * conv1_out_height * conv1_out_width;
 
-    // pool1: k=2, s=2
     const int pool_size = 2, pool_stride = 2;
     const int pool1_out_height = (conv1_out_height - pool_size) / pool_stride + 1; // 12
     const int pool1_out_width  = (conv1_out_width  - pool_size) / pool_stride + 1; // 12
-    const int pool1_out_elems  = conv1_out_channels * pool1_out_height * pool1_out_width; // 6*12*12=864
+    const int pool1_out_elems  = conv1_out_channels * pool1_out_height * pool1_out_width;
 
-    // conv2: 6 -> 16, k=5, s=1, p=0
     const int conv2_in_channels  = conv1_out_channels;
     const int conv2_out_channels = 16;
     const int conv2_kernel = 5, conv2_stride = 1, conv2_pad = 0;
     const int conv2_out_height = (pool1_out_height + 2 * conv2_pad - conv2_kernel) / conv2_stride + 1; // 8
     const int conv2_out_width  = (pool1_out_width  + 2 * conv2_pad - conv2_kernel) / conv2_stride + 1; // 8
-    const int conv2_out_elems  = conv2_out_channels * conv2_out_height * conv2_out_width; // 16*8*8=1024
+    const int conv2_out_elems  = conv2_out_channels * conv2_out_height * conv2_out_width;
 
-    // pool2: k=2, s=2
     const int pool2_out_height = (conv2_out_height - pool_size) / pool_stride + 1; // 4
     const int pool2_out_width  = (conv2_out_width  - pool_size) / pool_stride + 1; // 4
-    const int pool2_out_elems  = conv2_out_channels * pool2_out_height * pool2_out_width; // 16*4*4=256
+    const int pool2_out_elems  = conv2_out_channels * pool2_out_height * pool2_out_width; // 256
 
-    // FC layers
     const int fc1_in_features  = pool2_out_elems; // 256
     const int fc1_out_features = 120;
     const int fc2_in_features  = fc1_out_features; // 120
@@ -377,110 +422,106 @@ std::vector<int> scnn_inference(
     const int fc3_in_features  = fc2_out_features; // 84
     const int fc3_out_features = 10;
 
-    // IF neuron parameters (hard reset)
     const float v_threshold = 1.0f;
     const float v_reset     = 0.0f;
 
-    // --- Allocate reusable device buffers (once) ---
-    float *d_image = nullptr;
+    const int max_batch = 64; // can be tuned
+
+    float *d_images = nullptr;
     float *d_conv1_out = nullptr, *d_pool1 = nullptr;
     float *d_conv2_out = nullptr, *d_pool2 = nullptr, *d_flatten = nullptr;
     float *d_fc1_out = nullptr, *d_fc2_out = nullptr, *d_fc3_out = nullptr;
-
-    // Membrane potentials for IF nodes
     float *d_m1 = nullptr, *d_m2 = nullptr, *d_m3 = nullptr, *d_m4 = nullptr;
-    // Accumulated logits and argmax index on device
     float *d_logits_sum = nullptr;
-    int   *d_pred_index = nullptr;
+    int   *d_pred_indices = nullptr;
 
-    checkCudaErrors(cudaMalloc(&d_image,     in_channels * in_height * in_width * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_conv1_out, conv1_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool1,     pool1_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_conv2_out, conv2_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pool2,     pool2_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_flatten,   fc1_in_features * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc1_out,   fc1_out_features * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc2_out,   fc2_out_features * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_fc3_out,   fc3_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_images,    (size_t)max_batch * image_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv1_out, (size_t)max_batch * conv1_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool1,     (size_t)max_batch * pool1_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_conv2_out, (size_t)max_batch * conv2_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pool2,     (size_t)max_batch * pool2_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_flatten,   (size_t)max_batch * fc1_in_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc1_out,   (size_t)max_batch * fc1_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc2_out,   (size_t)max_batch * fc2_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_fc3_out,   (size_t)max_batch * fc3_out_features * sizeof(float)));
 
-    checkCudaErrors(cudaMalloc(&d_m1, conv1_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_m2, conv2_out_elems * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_m3, fc1_out_features * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_m4, fc2_out_features * sizeof(float)));
-    // Allocate device buffers for logits accumulation and argmax
-    checkCudaErrors(cudaMalloc(&d_logits_sum, fc3_out_features * sizeof(float)));
-    checkCudaErrors(cudaMalloc(&d_pred_index, sizeof(int)));
+    checkCudaErrors(cudaMalloc(&d_m1, (size_t)max_batch * conv1_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_m2, (size_t)max_batch * conv2_out_elems * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_m3, (size_t)max_batch * fc1_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_m4, (size_t)max_batch * fc2_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_logits_sum, (size_t)max_batch * fc3_out_features * sizeof(float)));
+    checkCudaErrors(cudaMalloc(&d_pred_indices, (size_t)max_batch * sizeof(int)));
 
-    // --- Loop over images ---
-    for (int i = 0; i < num_images; ++i) {
-        // Copy input image to device
-        checkCudaErrors(cudaMemcpy(
-            d_image, images[i].data(),
-            in_channels * in_height * in_width * sizeof(float),
-            cudaMemcpyHostToDevice));
+    std::vector<float> h_batch;
+    h_batch.reserve((size_t)max_batch * image_elems);
+    std::vector<int> h_pred_batch(max_batch);
 
-        // Reset membrane potentials for this sample
-        checkCudaErrors(cudaMemset(d_m1, 0, conv1_out_elems   * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_m2, 0, conv2_out_elems   * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_m3, 0, fc1_out_features  * sizeof(float)));
-        checkCudaErrors(cudaMemset(d_m4, 0, fc2_out_features  * sizeof(float)));
+    for (int offset = 0; offset < num_images; offset += max_batch) {
+        int b = std::min(max_batch, num_images - offset);
 
-        // Accumulate logits across T steps on device
-        checkCudaErrors(cudaMemset(d_logits_sum, 0, fc3_out_features * sizeof(float)));
+        h_batch.clear();
+        for (int i = 0; i < b; ++i) {
+            const std::vector<float>& img = images[offset + i];
+            h_batch.insert(h_batch.end(), img.begin(), img.end());
+        }
+        checkCudaErrors(cudaMemcpy(d_images, h_batch.data(), (size_t)b * image_elems * sizeof(float), cudaMemcpyHostToDevice));
+
+        checkCudaErrors(cudaMemset(d_m1, 0, (size_t)b * conv1_out_elems  * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_m2, 0, (size_t)b * conv2_out_elems  * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_m3, 0, (size_t)b * fc1_out_features * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_m4, 0, (size_t)b * fc2_out_features * sizeof(float)));
+        checkCudaErrors(cudaMemset(d_logits_sum, 0, (size_t)b * fc3_out_features * sizeof(float)));
 
         for (int t = 0; t < T; ++t) {
-            // conv1 -> IF1 -> pool1
             conv2d(
-                d_image, d_conv1_w, d_conv1_b, d_conv1_out,
+                d_images, d_conv1_w, d_conv1_b, d_conv1_out,
+                b,
                 in_channels, in_height, in_width,
                 conv1_out_channels, conv1_kernel, conv1_stride, conv1_pad
             );
-            if_neuron(d_conv1_out, d_m1, v_threshold, v_reset, conv1_out_elems);
+            if_neuron(d_conv1_out, d_m1, v_threshold, v_reset, b * conv1_out_elems);
             max_pool2d(
                 d_conv1_out, d_pool1,
+                b,
                 conv1_out_channels, conv1_out_height, conv1_out_width,
                 pool_size, pool_stride
             );
 
-            // conv2 -> IF2 -> pool2
             conv2d(
                 d_pool1, d_conv2_w, d_conv2_b, d_conv2_out,
+                b,
                 conv2_in_channels, pool1_out_height, pool1_out_width,
                 conv2_out_channels, conv2_kernel, conv2_stride, conv2_pad
             );
-            if_neuron(d_conv2_out, d_m2, v_threshold, v_reset, conv2_out_elems);
+            if_neuron(d_conv2_out, d_m2, v_threshold, v_reset, b * conv2_out_elems);
             max_pool2d(
                 d_conv2_out, d_pool2,
+                b,
                 conv2_out_channels, conv2_out_height, conv2_out_width,
                 pool_size, pool_stride
             );
 
-            // flatten
-            flatten(d_pool2, d_flatten, conv2_out_channels, pool2_out_height, pool2_out_width);
+            flatten(d_pool2, d_flatten, b, conv2_out_channels, pool2_out_height, pool2_out_width);
 
-            // fc1 -> IF3
-            linear(d_flatten, d_fc1_w, d_fc1_b, d_fc1_out, fc1_in_features, fc1_out_features);
-            if_neuron(d_fc1_out, d_m3, v_threshold, v_reset, fc1_out_features);
+            linear(d_flatten, d_fc1_w, d_fc1_b, d_fc1_out, b, fc1_in_features, fc1_out_features);
+            if_neuron(d_fc1_out, d_m3, v_threshold, v_reset, b * fc1_out_features);
 
-            // fc2 -> IF4
-            linear(d_fc1_out, d_fc2_w, d_fc2_b, d_fc2_out, fc2_in_features, fc2_out_features);
-            if_neuron(d_fc2_out, d_m4, v_threshold, v_reset, fc2_out_features);
+            linear(d_fc1_out, d_fc2_w, d_fc2_b, d_fc2_out, b, fc2_in_features, fc2_out_features);
+            if_neuron(d_fc2_out, d_m4, v_threshold, v_reset, b * fc2_out_features);
 
-            // fc3
-            linear(d_fc2_out, d_fc3_w, d_fc3_b, d_fc3_out, fc3_in_features, fc3_out_features);
-            // Accumulate logits on device to avoid host-device transfers per timestep
-            vector_add(d_logits_sum, d_fc3_out, d_logits_sum, fc3_out_features);
+            linear(d_fc2_out, d_fc3_w, d_fc3_b, d_fc3_out, b, fc3_in_features, fc3_out_features);
+
+            vector_add(d_logits_sum, d_fc3_out, d_logits_sum, b * fc3_out_features);
         }
 
-        // select argmax on device and copy back a single int
-        argmax_device(d_logits_sum, fc3_out_features, d_pred_index);
-        int pred = 0;
-        checkCudaErrors(cudaMemcpy(&pred, d_pred_index, sizeof(int), cudaMemcpyDeviceToHost));
-        predictions.push_back(pred);
+        argmax_batch_device(d_logits_sum, fc3_out_features, b, d_pred_indices);
+        checkCudaErrors(cudaMemcpy(h_pred_batch.data(), d_pred_indices, (size_t)b * sizeof(int), cudaMemcpyDeviceToHost));
+        for (int i = 0; i < b; ++i) {
+            predictions.push_back(h_pred_batch[i]);
+        }
     }
 
-    // free device buffers
-    checkCudaErrors(cudaFree(d_image));
+    checkCudaErrors(cudaFree(d_images));
     checkCudaErrors(cudaFree(d_conv1_out));
     checkCudaErrors(cudaFree(d_pool1));
     checkCudaErrors(cudaFree(d_conv2_out));
@@ -494,7 +535,7 @@ std::vector<int> scnn_inference(
     checkCudaErrors(cudaFree(d_m3));
     checkCudaErrors(cudaFree(d_m4));
     checkCudaErrors(cudaFree(d_logits_sum));
-    checkCudaErrors(cudaFree(d_pred_index));
+    checkCudaErrors(cudaFree(d_pred_indices));
 
     return predictions;
 }
