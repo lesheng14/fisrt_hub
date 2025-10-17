@@ -382,7 +382,23 @@ std::vector<int> scnn_inference(
     const float v_reset     = 0.0f;
 
     // --- Allocate reusable device buffers (once) ---
-    float *d_image = nullptr;
+    // Upload all images once: host pinned buffer -> single device buffer
+    const int image_elems = in_channels * in_height * in_width;
+    const size_t image_bytes = static_cast<size_t>(image_elems) * sizeof(float);
+    const size_t all_images_bytes = static_cast<size_t>(num_images) * image_bytes;
+    float* h_images_all = nullptr;  // pinned host buffer
+    checkCudaErrors(cudaMallocHost(reinterpret_cast<void**>(&h_images_all), all_images_bytes));
+    for (int i_img = 0; i_img < num_images; ++i_img) {
+        const float* src = images[i_img].data();
+        float* dst = h_images_all + static_cast<size_t>(i_img) * image_elems;
+        std::copy(src, src + image_elems, dst);
+    }
+    float* d_images_all = nullptr;
+    checkCudaErrors(cudaMalloc(&d_images_all, all_images_bytes));
+    checkCudaErrors(cudaMemcpy(d_images_all, h_images_all, all_images_bytes, cudaMemcpyHostToDevice));
+    checkCudaErrors(cudaFreeHost(h_images_all));
+    
+    // Per-layer intermediate buffers
     float *d_conv1_out = nullptr, *d_pool1 = nullptr;
     float *d_conv2_out = nullptr, *d_pool2 = nullptr, *d_flatten = nullptr;
     float *d_fc1_out = nullptr, *d_fc2_out = nullptr, *d_fc3_out = nullptr;
@@ -393,7 +409,6 @@ std::vector<int> scnn_inference(
     float *d_logits_sum = nullptr;
     int   *d_pred_index = nullptr;
 
-    checkCudaErrors(cudaMalloc(&d_image,     in_channels * in_height * in_width * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv1_out, conv1_out_elems * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_pool1,     pool1_out_elems * sizeof(float)));
     checkCudaErrors(cudaMalloc(&d_conv2_out, conv2_out_elems * sizeof(float)));
@@ -413,11 +428,8 @@ std::vector<int> scnn_inference(
 
     // --- Loop over images ---
     for (int i = 0; i < num_images; ++i) {
-        // Copy input image to device
-        checkCudaErrors(cudaMemcpy(
-            d_image, images[i].data(),
-            in_channels * in_height * in_width * sizeof(float),
-            cudaMemcpyHostToDevice));
+        // Select current image on device (no H2D copy per image)
+        const float* d_image_i = d_images_all + static_cast<size_t>(i) * image_elems;
 
         // Reset membrane potentials for this sample
         checkCudaErrors(cudaMemset(d_m1, 0, conv1_out_elems   * sizeof(float)));
@@ -431,7 +443,7 @@ std::vector<int> scnn_inference(
         for (int t = 0; t < T; ++t) {
             // conv1 -> IF1 -> pool1
             conv2d(
-                d_image, d_conv1_w, d_conv1_b, d_conv1_out,
+                d_image_i, d_conv1_w, d_conv1_b, d_conv1_out,
                 in_channels, in_height, in_width,
                 conv1_out_channels, conv1_kernel, conv1_stride, conv1_pad
             );
@@ -480,7 +492,7 @@ std::vector<int> scnn_inference(
     }
 
     // free device buffers
-    checkCudaErrors(cudaFree(d_image));
+    checkCudaErrors(cudaFree(d_images_all));
     checkCudaErrors(cudaFree(d_conv1_out));
     checkCudaErrors(cudaFree(d_pool1));
     checkCudaErrors(cudaFree(d_conv2_out));
